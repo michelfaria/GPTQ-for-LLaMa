@@ -30,6 +30,29 @@ __device__ double atomicAdd(
 }
 #endif
 
+#ifdef __CUDA_ARCH__
+#if __CUDA_ARCH__ < 700
+// adapted from https://github.com/torch/cutorch/blob/master/lib/THC/THCAtomics.cuh
+__device__ __forceinline__ void atomicAdd(c10::Half* address, c10::Half val) {
+    unsigned int *address_as_ui = reinterpret_cast<unsigned int *>(reinterpret_cast<char *>(address) - (reinterpret_cast<size_t>(address) & 2));
+    unsigned int old = *address_as_ui;
+    unsigned int assumed;
+
+    do {
+        assumed = old;
+        unsigned short hsum = reinterpret_cast<size_t>(address) & 2 ? (old >> 16) : (old & 0xffff);
+        hsum += val;
+        old = reinterpret_cast<size_t>(address) & 2
+                 ? (old & 0xffff) | (hsum << 16)
+                 : (old & 0xffff0000) | hsum;
+        old = atomicCAS(address_as_ui, assumed, old);
+
+    // Note: uses integer comparison to avoid hang in case of NaN (since NaN != NaN)
+    } while (assumed != old);
+}
+#endif
+#endif
+
 __device__ inline int as_int(int i) {
   return *reinterpret_cast<int*>(&i);
 }
@@ -122,11 +145,12 @@ __global__ void VecQuant3MatMulKernelFaster(
     int groupsize
 );
 
+template <typename scalar_t>
 __global__ void VecQuant4MatMulKernelFaster(
     const  half2* __restrict__ vec,
     const    int* __restrict__ mat,
-           float* __restrict__ mul,
-    const  float* __restrict__ scales,
+           scalar_t* __restrict__ mul,
+    const  scalar_t* __restrict__ scales,
     const    int* __restrict__ zeros,
     const    int* __restrict__ g_idx,
     int batch,
@@ -852,22 +876,27 @@ void vecquant4matmul_faster_cuda(
   );
   dim3 threads(BLOCKWIDTH);
 
-  VecQuant4MatMulKernelFaster<<<blocks, threads>>>(
-    (half2*) vec.data_ptr(),
-    mat.data_ptr<int>(),
-    mul.data_ptr<float>(),
-    scales.data_ptr<float>(),
-    zeros.data_ptr<int>(),
-    g_idx.data_ptr<int>(),
-    batch, vec_height, height, width, zero_width
-  );
+  AT_DISPATCH_SWITCH(vec.type(), "vecquant4matmul_faster_cuda",
+    AT_DISPATCH_CASE(at::ScalarType::Half, ([&] {
+      VecQuant4MatMulKernelFaster<<<blocks, threads>>>(
+        (half2*) vec.data_ptr<scalar_t>(),
+        mat.data_ptr<int>(),
+        mul.data_ptr<scalar_t>(),
+        scales.data_ptr<scalar_t>(),
+        zeros.data_ptr<int>(),
+        g_idx.data_ptr<int>(),
+        batch, vec_height, height, width, zero_width
+      );
+    })
+  ));
 }
 
+template <typename scalar_t>
 __global__ void VecQuant4MatMulKernelFaster(
     const  half2* __restrict__ vec,
     const    int* __restrict__ mat,
-           float* __restrict__ mul,
-    const  float* __restrict__ scales,
+           scalar_t* __restrict__ mul,
+    const  scalar_t* __restrict__ scales,
     const  	 int* __restrict__ zeros,
     const  	 int* __restrict__ g_idx,
 	  int batch,
@@ -901,7 +930,7 @@ __global__ void VecQuant4MatMulKernelFaster(
   int z_w = w / 8;
   int z_mod = (w % 8) * 4;
 
-  float res = 0;
+  scalar_t res = 0;
   half2 res2;
 
   unsigned int tmp;
@@ -910,9 +939,9 @@ __global__ void VecQuant4MatMulKernelFaster(
 
   while (k < blockwidth2) {
     int g = as_int(g_idx[g_h + (k * 2)]);
-	  float scale_f = scales[g * width + w];
-    half2 scale = __float2half2_rn(scale_f);
-    half2 zero = __float2half2_rn(-(scale_f * (((as_unsigned(zeros[g * zero_width + z_w]) >> z_mod) & 0xF) + 1)));
+	  scalar_t scale_f = scales[g * width + w];
+    half2 scale = __half2half2(scale_f);
+    half2 zero = __half2half2(__hmul(-scale_f, __int2half_rn(((as_unsigned(zeros[g * zero_width + z_w]) >> z_mod) & 0xF) + 1)));
 
     res2 = {};
     tmp = as_unsigned(mat[i]);
@@ -922,10 +951,11 @@ __global__ void VecQuant4MatMulKernelFaster(
     res2 = __hfma2(__hfma2(deq2[(tmp >> 24) & 0xff][off], scale, zero), blockvec[k + 3], res2);
 	  i += width;
     k += 4;
-    res += __half2float(res2.x) + __half2float(res2.y);
+    res = __hadd(res, __hadd(res2.x, res2.y));;
   }
 
-  atomicAdd(&mul[b * width + w], res);
+  __half* mul2 = (__half*)mul;
+  atomicAdd(&mul2[b * width + w], res);
 }
 
 template <typename scalar_t>
@@ -1037,12 +1067,13 @@ void vecquant4recons_v2_cuda(
   );
 }
 
+template <typename scalar_t>
 __global__ void VecQuant4MatMulV1KernelFaster(
     const  half2* __restrict__ vec,
     const    int* __restrict__ mat,
-           float* __restrict__ mul,
-    const  float* __restrict__ scales,
-    const  float* __restrict__ zeros,
+           scalar_t* __restrict__ mul,
+    const  scalar_t* __restrict__ scales,
+    const  scalar_t* __restrict__ zeros,
 	  int batch,
 	  int vec_height,
     int height,
@@ -1069,7 +1100,7 @@ __global__ void VecQuant4MatMulV1KernelFaster(
   int i = width * h + w;
   int k = 0;
 
-  float res = 0;
+  scalar_t res = 0;
   half2 res2;
 
   unsigned int tmp;
@@ -1077,10 +1108,10 @@ __global__ void VecQuant4MatMulV1KernelFaster(
   __syncthreads();
 
   while (k < blockwidth2) {
-	  float scale_f = scales[w];
-    float zero_f = zeros[w];
-    half2 scale = __float2half2_rn(scale_f);
-    half2 zero = __float2half2_rn(-zero_f);
+	  scalar_t scale_f = scales[w];
+    scalar_t zero_f = zeros[w];
+    half2 scale = __half2half2(scale_f);
+    half2 zero = __half2half2(-zero_f);
 
     res2 = {};
     tmp = as_unsigned(mat[i]);
@@ -1090,10 +1121,11 @@ __global__ void VecQuant4MatMulV1KernelFaster(
     res2 = __hfma2(__hfma2(deq2[(tmp >> 24) & 0xff][off], scale, zero), blockvec[k + 3], res2);
 	  i += width;
     k += 4;
-    res += __half2float(res2.x) + __half2float(res2.y);
+    res = __hadd(res, __hadd(res2.x, res2.y));
   }
 
-  atomicAdd(&mul[b * width + w], res);
+  __half* mul2 = (__half*)mul;
+  atomicAdd(&mul2[b * width + w], res);
 }
 
 void vecquant4matmul_v1_faster_cuda(
@@ -1115,14 +1147,18 @@ void vecquant4matmul_v1_faster_cuda(
   );
   dim3 threads(BLOCKWIDTH);
 
-  VecQuant4MatMulV1KernelFaster<<<blocks, threads>>>(
-    (half2*) vec.data_ptr(),
-    mat.data_ptr<int>(),
-    mul.data_ptr<float>(),
-    scales.data_ptr<float>(),
-    zeros.data_ptr<float>(),
-    batch, vec_height, height, width
-  );
+  AT_DISPATCH_SWITCH(vec.type(), "vecquant4matmul_v1_faster_cuda",
+    AT_DISPATCH_CASE(at::ScalarType::Half, ([&] {
+      VecQuant4MatMulV1KernelFaster<<<blocks, threads>>>(
+        (half2*) vec.data_ptr<scalar_t>(),
+        mat.data_ptr<int>(),
+        mul.data_ptr<scalar_t>(),
+        scales.data_ptr<scalar_t>(),
+        zeros.data_ptr<scalar_t>(),
+        batch, vec_height, height, width
+      );
+    })
+  ));
 }
 
 #define GROUPS_SEQ_V2 32
